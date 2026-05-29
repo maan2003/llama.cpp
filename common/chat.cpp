@@ -1700,12 +1700,11 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
     return data;
 }
 
-// LFM2.5 format: uses plain "List of tools: [...]" in system prompt, no wrapper tokens.
-// Tool calls are bare [name(arg="val")], though model may optionally emit <|tool_call_start|>.
+// LFM2.5 format: uses plain "List of tools: [...]" in system prompt.
 // - Reasoning: <think>{reasoning}</think> (optional)
 // - Content: text before a tool call (optional)
-// - Tool calls: Python-style, e.g. [function_name(arg1="value1", arg2="value2")]
-//   Tool calls can appear multiple times (parallel tool calls supported)
+// - Tool calls: Python-style, e.g. <|tool_call_start|>[function_name(arg1="value1", arg2="value2")]<|tool_call_end|>
+//   Tool calls can appear multiple times in one list when parallel tool calls are enabled
 static common_chat_params common_chat_params_init_lfm2_5(const common_chat_template &    tmpl,
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -1725,6 +1724,8 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
+    const std::string TOOL_CALL_START = "<|tool_call_start|>";
+    const std::string TOOL_CALL_END   = "<|tool_call_end|>";
     const std::string THINK_START     = "<think>";
     const std::string THINK_END       = "</think>";
     const std::string GEN_PROMPT      = "<|im_start|>assistant\n";
@@ -1758,13 +1759,14 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
 
         auto tool_calls = p.rule("tool-calls",
             p.trigger_rule("tool-call",
-                p.python_style_tool_calls(inputs.tools, inputs.parallel_tool_calls)
+                p.literal(TOOL_CALL_START) +
+                p.python_style_tool_calls(inputs.tools, inputs.parallel_tool_calls) +
+                p.literal(TOOL_CALL_END)
             )
         );
 
-        auto content = p.content(p.until_one_of({"<|tool_call_start|>", "["}));
-        auto maybe_start = p.optional(p.literal("<|tool_call_start|>"));
-        return generation_prompt + reasoning + content + maybe_start + tool_calls + end;
+        auto content = p.content(p.until(TOOL_CALL_START));
+        return generation_prompt + reasoning + content + tool_calls + end;
     });
 
     data.parser = parser.save();
@@ -1779,10 +1781,9 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
             });
             parser.build_grammar(builder, data.grammar_lazy);
         });
-        foreach_function(inputs.tools, [&](const json & tool) {
-            const std::string name = tool.at("function").at("name");
-            data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "[" + name + "(" });
-        });
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_CALL_START }
+        };
     }
 
     return data;
@@ -2301,8 +2302,8 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_lfm2(tmpl, params);
     }
 
-    // LFM2.5 format detection: template uses plain "List of tools: [...]" with no special tokens
-    if (src.find("List of tools: [") != std::string::npos &&
+    // LFM2.5 format detection: template uses plain "List of tools:" with no LFM2 tool-list special tokens
+    if (src.find("List of tools:") != std::string::npos &&
         src.find("<|tool_list_start|>") == std::string::npos) {
         LOG_DBG("Using specialized template: LFM2.5\n");
         return common_chat_params_init_lfm2_5(tmpl, params);
